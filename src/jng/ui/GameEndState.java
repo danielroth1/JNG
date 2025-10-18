@@ -2,7 +2,6 @@ package jng.ui;
 
 import java.awt.Point;
 
-import jdk.internal.net.http.common.Log;
 import org.newdawn.slick.GameContainer;
 import org.newdawn.slick.Graphics;
 import org.newdawn.slick.SlickException;

@@ -1,6 +1,5 @@
 package jng.ui;
 
-import jdk.jfr.StackTrace;
 import org.lwjgl.LWJGLException;
 import org.lwjgl.opengl.Display;
 import org.lwjgl.opengl.DisplayMode;
@@ -36,14 +35,40 @@ public class Jng extends StateBasedGame {
  
     public static void main(String[] args) throws SlickException
     {
-    	// Setze den library Pfad abhaengig vom Betriebssystem
-    	if (System.getProperty("os.name").toLowerCase().contains("windows")) {
-    		System.setProperty("org.lwjgl.librarypath",System.getProperty("user.dir") + "/native/windows");
-    	} else if (System.getProperty("os.name").toLowerCase().contains("mac")) {
-    		System.setProperty("org.lwjgl.librarypath",System.getProperty("user.dir") + "/native/macosx");
-    	} else {
-    		System.setProperty("org.lwjgl.librarypath",System.getProperty("user.dir") + "/native/" +System.getProperty("os.name").toLowerCase());
-    	}
+        // Set the library path depending on the OS. Prefer explicit folders (windows, macosx)
+        // but verify the directory exists. If not found, print helpful diagnostics.
+        String userDir = System.getProperty("user.dir");
+        String osName = System.getProperty("os.name").toLowerCase();
+        String[] candidates;
+        if (osName.contains("windows")) {
+            candidates = new String[] { "native/windows", "native/" + osName };
+        } else if (osName.contains("mac")) {
+            // historically this project used "macosx" as the folder name
+            candidates = new String[] { "native/macosx", "native/mac", "native/" + osName };
+        } else {
+            candidates = new String[] { "native/" + osName, "native/linux" };
+        }
+
+        String chosen = null;
+        for (String rel : candidates) {
+            java.io.File f = new java.io.File(userDir, rel);
+            if (f.exists() && f.isDirectory()) {
+                chosen = f.getAbsolutePath();
+                break;
+            }
+        }
+
+        if (chosen != null) {
+            System.setProperty("org.lwjgl.librarypath", chosen);
+            System.out.println("Using LWJGL natives from: " + chosen);
+        } else {
+            // No suitable native folder found — fall back to default and print instructions
+            String attempted = String.join(", ", candidates);
+            System.err.println("WARNING: No LWJGL native folder found for this OS. Tried: " + attempted);
+            System.err.println("The game will attempt to load native libraries from the default path, which may fail.");
+            System.err.println("Please place the LWJGL native libraries for your platform into one of the project's 'native' folders (e.g. native/macosx) or start Java with -Djava.library.path=/path/to/natives");
+            System.err.println("Existing native folders: " + java.util.Arrays.toString(new java.io.File(userDir, "native").list()));
+        }
 
     	// Setze dieses StateBasedGame in einen App Container (oder Fenster)
         app = new AppGameContainer(new Jng());
