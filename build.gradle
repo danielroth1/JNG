@@ -1,24 +1,42 @@
 plugins {
-    id 'java'
-    id 'application'
+	id 'java'
+	id 'application'
 }
 
-group = 'jng'
-version = '1.0-SNAPSHOT'
+group = 'com.example.jng'
+version = '1.0'
 
-sourceCompatibility = 1.8
-targetCompatibility = 1.8
+java {
+	sourceCompatibility = JavaVersion.VERSION_11
+	targetCompatibility = JavaVersion.VERSION_11
+}
 
 repositories {
-    mavenCentral()
-    flatDir {
+	mavenCentral()
+	flatDir {
         dirs 'jars'
     }
 }
 
+// Project uses a non-standard layout (sources under `src/` not `src/main/java`).
+// Add the top-level `src` directory as a Java source root so Gradle will compile the classes.
+sourceSets {
+	main {
+		java {
+			srcDirs = ['src']
+		}
+		resources {
+			// Keep default resources and also include the resources/ folder at repo root
+			srcDirs = ['resources', 'src']
+			// Avoid copying Java source files as resources
+			exclude '**/*.java'
+		}
+	}
+}
+
 dependencies {
-    implementation fileTree(dir: 'jars', include: ['*.jar'])
-    implementation files(
+
+	implementation files(
         'jars/hamcrest-core-1.3.jar',
         'jars/hamcrest-library-1.3.jar',
         'jars/jogg-0.0.7.jar',
@@ -31,45 +49,427 @@ dependencies {
 }
 
 application {
-    mainClass = 'jng.ui.Jng'
+	// application's main class (FQCN)
+	mainClass = 'jng.ui.Jng'
 }
 
-// Configure resources to include assets directory
-sourceSets {
-    main {
-        java {
-            srcDirs = ['src']
-        }
-        resources {
-            srcDirs = ['assets']
-        }
-    }
+jar {
+	manifest {
+		attributes 'Main-Class': application.mainClass
+	}
 }
 
-// Configure the run task to use the correct system properties
-run {
-    systemProperty 'java.library.path', 'native/linux'
-    systemProperty 'file.encoding', 'Cp1252'
-    workingDir = projectDir
+// Create a fat (uber) JAR without requiring the Shadow plugin.
+// This collects runtimeClasspath entries and unzips them into a single jar.
+task fatJar(type: Jar) {
+	archiveBaseName.set(project.name)
+	archiveClassifier.set('all')
+	from(sourceSets.main.output)
+	dependsOn configurations.runtimeClasspath
+	from {
+		configurations.runtimeClasspath.findAll { it.name.endsWith('jar') }.collect { zipTree(it) }
+	}
+	// Avoid failing on duplicate entries (some jars include the same LICENSE or META-INF files)
+	duplicatesStrategy = DuplicatesStrategy.EXCLUDE
+	manifest {
+		attributes 'Main-Class': application.mainClass
+	}
 }
 
-// Create OS-specific run tasks
-task runLinux(type: JavaExec) {
-    group = 'application'
-    description = 'Run the application on Linux'
-    classpath = sourceSets.main.runtimeClasspath
-    mainClass = 'jng.ui.Jng'
-    systemProperty 'java.library.path', 'native/linux'
-    systemProperty 'file.encoding', 'Cp1252'
-    workingDir = projectDir
+tasks.build {
+	dependsOn fatJar
 }
 
-task runWindows(type: JavaExec) {
-    group = 'application'
-    description = 'Run the application on Windows'
-    classpath = sourceSets.main.runtimeClasspath
-    mainClass = 'jng.ui.Jng'
-    systemProperty 'java.library.path', 'native/windows'
-    systemProperty 'file.encoding', 'Cp1252'
-    workingDir = projectDir
+// Prepare a directory that will be passed to jpackage as the --input directory.
+// This directory will contain the fat JAR plus the `native` and `assets` folders so
+// they get bundled into the generated installer/app-image.
+task prepareJPackageInput(type: Copy) {
+	dependsOn fatJar
+	def outDir = file('build/jpackage-input')
+	// clean the output directory first
+	doFirst {
+		if (outDir.exists()) { project.delete(outDir) }
+		outDir.mkdirs()
+		// Log what will be copied into the jpackage input
+		logger.lifecycle("Preparing jpackage input directory: ${outDir}")
+		try {
+			def jarFile = fatJar.archiveFile.get().asFile
+			logger.lifecycle("Will copy fat JAR: ${jarFile.name} -> ${outDir}")
+		} catch(Exception e) {
+			// archiveFile may not be available at configuration time; this runs during task execution so it should succeed.
+			logger.lifecycle('Will copy fat JAR (name unknown yet) -> ' + outDir)
+		}
+		['native','assets'].each { res ->
+			def appRes = file("app/${res}")
+			def rootRes = file(res)
+			if (appRes.exists()) {
+				logger.lifecycle("Will copy: ${appRes} -> ${new File(outDir, res)}")
+			} else if (rootRes.exists()) {
+				logger.lifecycle("Will copy: ${rootRes} -> ${new File(outDir, res)}")
+			} else {
+				logger.lifecycle("Skipping: ${res} not found in app/ or project root")
+			}
+		}
+	}
+
+	// copy the fat jar produced by fatJar
+	from({ fatJar.archiveFile.get().asFile }) {
+		into ''
+	}
+
+	// copy native and assets folders if present. Prefer folders under `app/` and
+	// fall back to top-level folders. Each is copied into the jpackage input root
+	// so the installer/app-image will see them at application root.
+	['native', 'assets'].each { res ->
+		def appRes = file("app/${res}")
+		def rootRes = file(res)
+		if (appRes.exists()) {
+			from(appRes) { into res }
+		} else if (rootRes.exists()) {
+			from(rootRes) { into res }
+		}
+	}
+
+	into outDir
+	duplicatesStrategy = DuplicatesStrategy.EXCLUDE
+
+	// Also prepare a resource directory for jpackage so we can place files at the
+	// top-level of the generated image (next to the native launchers) rather
+	// than inside the `app/` subfolder. We'll copy assets/native into
+	// build/jpackage-resources if they exist.
+	doLast {
+		def resOut = file('build/jpackage-resources')
+		if (resOut.exists()) { project.delete(resOut) }
+		resOut.mkdirs()
+		['native','assets'].each { res ->
+			def appRes = file("app/${res}")
+			def rootRes = file(res)
+			if (appRes.exists()) {
+				logger.lifecycle("Copying resources: ${appRes} -> ${new File(resOut, res).path}")
+				copy { from appRes; into new File(resOut, res).path }
+			} else if (rootRes.exists()) {
+				logger.lifecycle("Copying resources: ${rootRes} -> ${new File(resOut, res).path}")
+				copy { from rootRes; into new File(resOut, res).path }
+			} else {
+				logger.lifecycle("No resources to copy for: ${res}")
+			}
+		}
+	}
+}
+
+// Ensure all copy-like operations don't fail on duplicate entries when assembling distributions
+tasks.withType(Copy).configureEach {
+	// default to excluding duplicates rather than failing the build
+	duplicatesStrategy = DuplicatesStrategy.EXCLUDE
+}
+
+// Creates a Windows native executable (EXE) / installer using jpackage.
+// Requirements: jpackage available on PATH (JDK 14+). For MSI installer, WiX toolset is required.
+tasks.register('packageWindows', Exec) {
+	dependsOn prepareJPackageInput
+	group = 'distribution'
+	description = 'Package the application as a native Windows executable using jpackage'
+
+	doFirst {
+		// Allow overrides via Gradle project properties for CI or manual paths
+		if (project.hasProperty('jlinkPath')) {
+			jlinkPath = project.property('jlinkPath') as String
+			logger.lifecycle("Using jlinkPath from project property: " + jlinkPath)
+		}
+		if (project.hasProperty('jmodsDir')) {
+			jmodsDir = project.property('jmodsDir') as String
+			logger.lifecycle("Using jmodsDir from project property: " + jmodsDir)
+		}
+		def jarFile = fatJar.archiveFile.get().asFile
+		def inputDir = jarFile.parentFile.absolutePath
+		def jarName = jarFile.name
+
+			// Build jpackage args dynamically so we only pass --icon if the file exists
+			def args = [] as List
+			args << 'jpackage'
+			args << '--type' << 'exe'
+			// use prepared input including native and assets
+			args << '--input' << file('build/jpackage-input').absolutePath
+			args << '--name' << project.name
+			args << '--main-jar' << jarName
+			// include resources so assets/ and native/ land at the image root (next to the launcher)
+			args << '--resource-dir' << file('build/jpackage-resources').absolutePath
+			// application.mainClass is a Property<String>; pass the actual value
+			def mainClassValue = null
+			try {
+				mainClassValue = application.mainClass.get()
+			} catch(Exception e) {
+				mainClassValue = application.mainClass.toString()
+			}
+			args << '--main-class' << mainClassValue
+			def iconFile = file('resources/icon.ico')
+			if (iconFile.exists()) {
+				args << '--icon' << iconFile.path
+			} else {
+				logger.lifecycle('resources/icon.ico not found — packaging will proceed without a custom icon')
+			}
+			args << '--app-version' << project.version
+			args << '--dest' << 'installer'
+
+			// Windows-specific UX options
+			args << '--win-shortcut'
+			args << '--win-menu'
+			args << '--win-dir-chooser'
+			args << '--win-per-user-install'
+			args << '--vendor' << "Mailbase"
+
+			// Prefer jpackage from JAVA_HOME if available to ensure platform-correct tool
+			def javaHome = System.getenv('JAVA_HOME')
+			if (javaHome) {
+				def jpackagePath = file(javaHome).toPath().resolve('bin').resolve('jpackage').toFile().path
+				args[0] = jpackagePath
+			}
+			logger.lifecycle('Running jpackage with args: ' + args.join(' '))
+			commandLine args
+	}
+
+		// After packaging, move assets/native out of the `app/` subfolder (if present)
+		doLast {
+			def destDir = file('installer')
+			if (!destDir.exists()) {
+				logger.lifecycle('No installer output directory found at: ' + destDir.path)
+				return
+			}
+			// Find generated directory or files inside installer
+			def generated = destDir.listFiles()?.find { it.isDirectory() }
+			if (generated == null) {
+				logger.lifecycle('No generated directory found inside installer: ' + destDir.path)
+				return
+			}
+			// The app folder is often inside the generated dir (named 'app' or similar)
+			def appFolder = new File(generated, 'app')
+			if (!appFolder.exists()) {
+				// try to find an app subfolder by searching first-level directories
+				appFolder = generated.listFiles()?.find { it.isDirectory() && it.name.toLowerCase().contains('app') }
+			}
+			if (appFolder == null || !appFolder.exists()) {
+				logger.lifecycle('No app folder found inside generated directory: ' + generated.path)
+				return
+			}
+			['assets','native'].each { res ->
+				def src = new File(appFolder, res)
+				def dest = new File(generated, res)
+				if (src.exists()) {
+					logger.lifecycle('Moving ' + src.path + ' -> ' + dest.path)
+					// use copy then delete to be safe across filesystems
+					copy { from src; into dest }
+					project.delete(src)
+				} else {
+					logger.lifecycle(res + ' not present in app folder; nothing to move')
+				}
+			}
+		}
+}
+
+// Task to always produce an app-image (no WiX, no MSI/EXE installer). This creates a runnable folder
+// that includes the native launcher and the bundled JRE so the app runs on machines without Java.
+tasks.register('packageAppImage', Exec) {
+	dependsOn prepareJPackageInput
+	group = 'distribution'
+	description = 'Package the application as an app-image (standalone folder with bundled runtime)'
+
+	doFirst {
+			def jarFile = fatJar.archiveFile.get().asFile
+			def inputDir = jarFile.parentFile.absolutePath
+			def jarName = jarFile.name
+			// Derive a clean base name for extra launcher (strip non-alphanumeric)
+			def consoleLauncherName = project.name + 'Console'
+
+			// Destination base: dist. We will create dist/app-image for jpackage output
+			def distDir = file('dist')
+			def appImageContainer = distDir.toPath().resolve('app-image').toFile()
+			// Remove existing dist/app-image at the beginning as requested
+			if (appImageContainer.exists()) {
+				logger.lifecycle('Removing existing app-image container: ' + appImageContainer.path)
+				project.delete(appImageContainer)
+			}
+
+			def args = [] as List
+			// Prefer jpackage from JAVA_HOME if available
+			def javaHome = System.getenv('JAVA_HOME')
+			if (javaHome) {
+				args << file(javaHome).toPath().resolve('bin').resolve('jpackage').toFile().path
+			} else {
+				args << 'jpackage'
+			}
+
+			args << '--type' << 'app-image'
+			args << '--input' << file('build/jpackage-input').absolutePath
+			args << '--name' << project.name
+			args << '--main-jar' << jarName
+			// include resources so assets/ and native/ land at the image root (next to the launcher)
+			args << '--resource-dir' << file('build/jpackage-resources').absolutePath
+			args << '--main-class' << application.mainClass.get()
+
+			def iconFile = file('resources/icon.ico')
+			if (iconFile.exists()) { args << '--icon' << iconFile.path }
+
+			// Create an additional console-enabled launcher inside the app-image
+			// Using --add-launcher <name>=<properties-file> with win-console=true
+			def tmpDir = file('build/tmp/jpackage')
+			tmpDir.mkdirs()
+			def consoleProps = new File(tmpDir, 'console-launcher.properties')
+			consoleProps.text = 'win-console=true' + System.lineSeparator()
+			args << '--add-launcher' << "${consoleLauncherName}=${consoleProps.path}"
+
+			args << '--app-version' << project.version
+			// direct jpackage to create the app-image inside dist/app-image
+			args << '--dest' << appImageContainer.path
+
+			logger.lifecycle('Running jpackage (app-image) with args: ' + args.join(' '))
+			commandLine args
+	}
+
+		// After jpackage creates the app-image, move assets/native out of the app/ subfolder to the image root
+		doLast {
+			def appImageRoot = file('dist').toPath().resolve('app-image').toFile()
+			if (!appImageRoot.exists()) {
+				logger.lifecycle('No app-image produced under: ' + appImageRoot.path)
+				return
+			}
+			// Find first generated image directory
+			def generated = appImageRoot.listFiles()?.find { it.isDirectory() }
+			if (generated == null) {
+				logger.lifecycle('No generated app-image directory found inside: ' + appImageRoot.path)
+				return
+			}
+			def appFolder = new File(generated, 'app')
+			if (!appFolder.exists()) {
+				appFolder = generated.listFiles()?.find { it.isDirectory() && it.name.toLowerCase().contains('app') }
+			}
+			if (appFolder == null || !appFolder.exists()) {
+				logger.lifecycle('No app folder inside app-image: ' + generated.path)
+				return
+			}
+			['assets','native'].each { res ->
+				def src = new File(appFolder, res)
+				def dest = new File(generated, res)
+				if (src.exists()) {
+					logger.lifecycle('Moving ' + src.path + ' -> ' + dest.path)
+					copy { from src; into dest }
+					project.delete(src)
+				} else {
+					logger.lifecycle(res + ' not present in app folder; nothing to move')
+				}
+			}
+		}
+
+		doLast {
+			// After jpackage runs, find the generated app-image folder inside dist/app-image and zip it into dist
+			def appImageRoot = file('dist').toPath().resolve('app-image').toFile()
+			if (!appImageRoot.exists()) {
+				logger.lifecycle('No app-image produced under: ' + appImageRoot.path)
+				return
+			}
+			// Find first directory inside appImageRoot (the generated app image)
+			def generated = appImageRoot.listFiles()?.find { it.isDirectory() }
+			if (generated == null) {
+				logger.lifecycle('No generated app-image directory found inside: ' + appImageRoot.path)
+				return
+			}
+			def zipName = generated.name + '.zip'
+			def zipFile = file('dist').toPath().resolve(zipName).toFile()
+			logger.lifecycle('Creating zip of app-image: ' + generated.path + ' -> ' + zipFile.path)
+			ant.zip(destfile: zipFile.path, basedir: generated.path)
+			logger.lifecycle('Created app-image zip: ' + zipFile.path)
+		}
+}
+
+// Create a minimized runtime image with jlink. Adjust modules as needed for your app.
+tasks.register('createRuntimeImage', Exec) {
+	group = 'distribution'
+	description = 'Create a runtime image using jlink for smaller app bundles'
+
+	doFirst {
+		// Locate jlink: prefer JAVA_HOME, fallback to PATH. Provide actionable errors.
+		def javaHomeEnv = System.getenv('JAVA_HOME')
+		def jlinkPath = null
+
+		if (javaHomeEnv) {
+			def candidate = file(javaHomeEnv).toPath().resolve('bin').resolve('jlink').toFile()
+			if (candidate.exists()) {
+				jlinkPath = candidate.path
+			} else {
+				candidate = file(javaHomeEnv).toPath().resolve('bin').resolve('jlink.exe').toFile()
+				if (candidate.exists()) { jlinkPath = candidate.path }
+			}
+		}
+
+		if (!jlinkPath) {
+			def pathEnv = System.getenv('PATH')
+			if (pathEnv) {
+				pathEnv.split(File.pathSeparator).each { p ->
+					if (!jlinkPath) {
+						def f = new File(p, 'jlink')
+						def fe = new File(p, 'jlink.exe')
+						if (f.exists()) { jlinkPath = f.path }
+						if (fe.exists()) { jlinkPath = fe.path }
+					}
+				}
+			}
+		}
+
+		if (!jlinkPath) {
+			throw new GradleException("jlink not found. Set JAVA_HOME to a JDK (9+) that contains jlink and a 'jmods' folder, or install a JDK and add its bin to PATH. On Windows set JAVA_HOME to the JDK root (for example C:\\Program Files\\Java\\jdk-17).")
+		}
+
+		logger.lifecycle("Using jlink executable: " + jlinkPath)
+
+		// Determine jmods directory (prefer JAVA_HOME/jmods; otherwise infer from jlink location)
+		def jmodsDir = null
+		if (javaHomeEnv) {
+			def jm = file(javaHomeEnv).toPath().resolve('jmods').toFile()
+			if (jm.exists()) { jmodsDir = jm.path }
+		}
+		if (!jmodsDir) {
+			// jlink is usually in <jdk>/bin, so jmods should be in the parent directory of bin
+			def jlinkParent = file(jlinkPath).toPath().getParent().getParent()
+			def jm = jlinkParent.resolve('jmods').toFile()
+			if (jm.exists()) { jmodsDir = jm.path }
+		}
+		if (!jmodsDir) {
+			throw new GradleException("jmods directory not found. A JDK installation with a 'jmods' folder is required by jlink. If JAVA_HOME points to a JRE, replace it with a JDK.")
+		}
+
+		def outputDir = file('build/runtime')
+		if (outputDir.exists()) {
+			logger.lifecycle('Removing existing runtime directory: ' + outputDir.path)
+			project.delete(outputDir)
+		}
+		def output = outputDir.absolutePath
+		// modules: at least include java.base and java.desktop for Swing/AWT
+		def modules = 'java.base,java.desktop,java.logging'
+		def args = [jlinkPath, '--module-path', file(jmodsDir).absolutePath, '--add-modules', modules, '--output', output, '--compress', '2', '--no-header-files', '--no-man-pages']
+		logger.lifecycle('Running jlink: ' + args.join(' '))
+		commandLine args
+	}
+}
+
+// Make packageAppImage depend on runtime image by default (optional). If you prefer not to use jlink,
+// call packageAppImage directly.
+tasks.named('packageAppImage') {
+	dependsOn 'createRuntimeImage'
+	doFirst {
+		def runtimeDir = file('build/runtime')
+		if (runtimeDir.exists()) {
+			// insert --runtime-image before --dest
+			// find index of --dest and insert --runtime-image <path> before it
+			def destIndex = null
+			for (int i = 0; i < commandLine.size(); i++) {
+				if (commandLine.get(i) == '--dest') { destIndex = i; break }
+			}
+			if (destIndex != null) {
+				def argsList = new ArrayList(commandLine)
+				argsList.add(destIndex, runtimeDir.path)
+				argsList.add(destIndex, '--runtime-image')
+				commandLine = argsList
+				logger.lifecycle('Added --runtime-image ' + runtimeDir.path + ' to jpackage args')
+			}
+		}
+	}
 }
