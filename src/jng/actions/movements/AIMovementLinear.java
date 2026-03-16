@@ -71,8 +71,9 @@ public class AIMovementLinear extends AIMovementAction{
 
 	@Override
 	public void update(GameContainer gc, StateBasedGame sb, int delta, Component event) {
-		// TODO Auto-generated method stub
-		
+		Vector2f nextPos = getNextPosition(event.getOwnerEntity().getPosition(),
+				speed, event.getOwnerEntity().getRotation(), delta);
+		event.getOwnerEntity().setPosition(nextPos);
 	}
 
 	@Override
